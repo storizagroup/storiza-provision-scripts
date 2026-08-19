@@ -61,12 +61,13 @@ One file per product, filed by what it is:
 
 ```
 panels/
-  gamepanels/     pterodactyl.sh, pelican.sh, ...
-  webpanels/      cpanel.sh, cyberpanel.sh, aapanel.sh, ...
+  gamepanels/     pterodactyl.sh, mcsmanager.sh, ...
+  webpanels/      cloudpanel.sh, cyberpanel.sh, cpanel.sh, ...
+  paas/           coolify.sh, dokploy.sh, easypanel.sh, ...
 applications/
+  cms/            wordpress.sh, ...
   automation/     n8n.sh, ...
   databases/      ...
-  monitoring/     ...
 ```
 
 The path is the contract: a template's `provisionScriptURL` points straight at the raw
@@ -88,9 +89,26 @@ directory rather than bending an existing name.
 
 ## What is here
 
-| Script | Installs |
-|---|---|
-| [`panels/gamepanels/pterodactyl.sh`](panels/gamepanels/pterodactyl.sh) | Pterodactyl Panel + Wings, first admin, node and allocations |
+| Script | Installs | Panel reachable at |
+|---|---|---|
+| [`panels/gamepanels/pterodactyl.sh`](panels/gamepanels/pterodactyl.sh) | Pterodactyl Panel + Wings, first admin, node and allocations | `443` |
+| [`panels/gamepanels/mcsmanager.sh`](panels/gamepanels/mcsmanager.sh) | MCSManager + Java 21, behind nginx | `443` |
+| [`panels/webpanels/cloudpanel.sh`](panels/webpanels/cloudpanel.sh) | CloudPanel, admin account created via `clpctl` | `8443` |
+| [`panels/webpanels/cyberpanel.sh`](panels/webpanels/cyberpanel.sh) | CyberPanel (OpenLiteSpeed), silent install | `8090` |
+| [`panels/webpanels/cpanel.sh`](panels/webpanels/cpanel.sh) | cPanel & WHM — **licence required, not included** | `2087` |
+| [`panels/paas/coolify.sh`](panels/paas/coolify.sh) | Coolify, root user seeded from the payload | `443` or `8443` |
+| [`panels/paas/dokploy.sh`](panels/paas/dokploy.sh) | Dokploy, behind nginx | `8443` |
+| [`panels/paas/easypanel.sh`](panels/paas/easypanel.sh) | Easypanel, behind nginx | `8443` |
+| [`applications/cms/wordpress.sh`](applications/cms/wordpress.sh) | WordPress on NGINX + PHP-FPM + MariaDB, install completed | `443` |
+
+Every one of them serves the panel over HTTPS: Let's Encrypt where a domain was
+answered and the panel does not manage its own certificates, self-signed
+otherwise. Panels that already ship their own TLS (CloudPanel, CyberPanel,
+cPanel) keep theirs.
+
+A note on ports 80 and 443: Coolify, Dokploy and Easypanel run their own proxy
+there to serve the applications you deploy, so those scripts put the dashboard
+on `8443` instead of taking 443 away from them.
 
 `tests/pterodactyl-payload-check.sh` runs that script's payload parsing against fixtures
 without installing anything — `bash tests/pterodactyl-payload-check.sh` from the repository
