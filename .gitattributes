@@ -1,0 +1,2 @@
+# These are fetched by curl and run by bash on Linux. CRLF would break the shebang.
+*.sh text eol=lf
