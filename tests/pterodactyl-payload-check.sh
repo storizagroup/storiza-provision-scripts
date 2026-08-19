@@ -27,7 +27,7 @@ printf '%s' '{"vps":{"ip":{"address":"203.0.113.7"}},"inputs":{"panel_domain":"p
 
 APP_URL=""
 run full.json
-[ "$ADMIN_EMAIL" = "me@example.com" ] && [ "$APP_URL" = "http://panel.example.com" ] \
+[ "$ADMIN_EMAIL" = "me@example.com" ] && [ "$APP_URL" = "https://panel.example.com" ] \
   && [ "$PANEL_FQDN" = "panel.example.com" ] && [ "$ASSIGNED_IP" = "203.0.113.7" ] \
   && [ "$ADMIN_USER" = "admin" ] && echo "full payload    -> ok" || { echo "full payload FAILED"; exit 1; }
 

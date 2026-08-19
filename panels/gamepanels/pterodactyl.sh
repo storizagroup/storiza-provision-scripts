@@ -41,8 +41,12 @@ DB_PANEL_USER="pterodactyl"
 DB_PANEL_NAME="panel"
 
 APP_URL=""                               # Leave empty to auto-detect IP
-USE_SSL="no"                             # "yes" to use Let's Encrypt (needs real domain)
 TIMEZONE="UTC"
+
+# Where the self-signed certificate lives when there is no domain to get a
+# real one for. The panel is HTTPS either way -- a game panel hands out
+# passwords and API keys, and plaintext on a shared network is not an option.
+SELF_SIGNED_DIR="/etc/pterodactyl/ssl"
 
 NODE_NAME="node-01"
 LOCATION_SHORT="dc-1"
@@ -153,8 +157,8 @@ ADMIN_LASTNAME="istrator"
 # actually propagated, because certbot failing would abort the whole install.
 if [ -n "$PANEL_DOMAIN" ]; then
     PANEL_FQDN="$PANEL_DOMAIN"
-    APP_URL="http://${PANEL_DOMAIN}"
-    log "Panel domain: $PANEL_DOMAIN (run certbot once its DNS resolves)"
+    APP_URL="https://${PANEL_DOMAIN}"
+    log "Panel domain: $PANEL_DOMAIN"
 else
     log "No panel domain answered -- the panel will answer on the server IP"
 fi
@@ -171,7 +175,7 @@ PUBLIC_IP="$ASSIGNED_IP"
 log "Public IP: $PUBLIC_IP"
 
 if [ -z "$APP_URL" ]; then
-    APP_URL="http://${PUBLIC_IP}"
+    APP_URL="https://${PUBLIC_IP}"
     PANEL_FQDN="$PUBLIC_IP"
 fi
 
@@ -375,7 +379,7 @@ touch /tmp/.ptero_install_running
 ) &
 LOG_SYNC_PID=$!
 
-log "Install status page: http://${PUBLIC_IP}/"
+log "Install status page: https://${PUBLIC_IP}/ (port 80 redirects there)"
 
 # PHP repository
 if [ "$OS_ID" = "ubuntu" ]; then
@@ -512,10 +516,47 @@ step "Configuring Nginx"
 
 rm -f /etc/nginx/sites-enabled/default
 
+# A certificate has to exist before nginx will start with a 443 block, and
+# Let's Encrypt cannot issue one for an IP address -- so every server gets a
+# self-signed certificate now, and a real one replaces it below if a domain
+# was answered and its DNS already points here.
+mkdir -p "$SELF_SIGNED_DIR"
+if [ ! -s "$SELF_SIGNED_DIR/self.crt" ]; then
+    SAN="IP:${PUBLIC_IP}"
+    [ -n "$PANEL_DOMAIN" ] && SAN="DNS:${PANEL_DOMAIN},${SAN}"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -sha256 \
+        -keyout "$SELF_SIGNED_DIR/self.key" -out "$SELF_SIGNED_DIR/self.crt" \
+        -subj "/CN=${PANEL_FQDN}" -addext "subjectAltName=${SAN}" 2>/dev/null
+    chmod 600 "$SELF_SIGNED_DIR/self.key"
+    log "Self-signed certificate created for ${SAN}"
+fi
+
+SSL_CERT="$SELF_SIGNED_DIR/self.crt"
+SSL_KEY="$SELF_SIGNED_DIR/self.key"
+SSL_IS_TRUSTED="no"
+
 cat > /etc/nginx/sites-available/pterodactyl.conf <<NGINX_CONF
 server {
     listen 80;
     server_name ${PANEL_FQDN} _;
+
+    # Left reachable so certbot's http-01 challenge can be answered later.
+    location ^~ /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    # No http2 and no [::] here on purpose: the directive spelling changed in
+    # nginx 1.25 and a host with IPv6 off cannot bind [::], and either one
+    # would fail the nginx config test and take the whole install down with it.
+    listen 443 ssl;
+    server_name ${PANEL_FQDN} _;
+
+    ssl_certificate     ${SSL_CERT};
+    ssl_certificate_key ${SSL_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
 
     root /var/www/pterodactyl/public;
     index index.html index.htm index.php;
@@ -540,6 +581,9 @@ server {
         fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_param HTTP_PROXY "";
+        # Without this Laravel builds asset URLs as http:// and the browser
+        # blocks every one of them as mixed content.
+        fastcgi_param HTTPS on;
         fastcgi_intercept_errors off;
         fastcgi_buffer_size 16k;
         fastcgi_buffers 4 16k;
@@ -558,11 +602,23 @@ nginx -t
 systemctl enable --now nginx
 systemctl restart nginx
 
-if [ "$USE_SSL" = "yes" ] && [ "$PANEL_FQDN" != "$PUBLIC_IP" ]; then
-    certbot --nginx -d "$PANEL_FQDN" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect
-    APP_URL="https://${PANEL_FQDN}"
-    sed -i "s|APP_URL=.*|APP_URL=${APP_URL}|" /var/www/pterodactyl/.env
-    php artisan config:clear
+# A real certificate needs the domain's A record to already point here, which
+# is not something we can wait for. If it is not ready the self-signed one
+# stays and the customer runs certbot themselves -- the panel works either way.
+if [ -n "$PANEL_DOMAIN" ]; then
+    step "Requesting a Let's Encrypt certificate for ${PANEL_DOMAIN}"
+    if certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos \
+        -m "$ADMIN_EMAIL" --redirect --keep-until-expiring; then
+        SSL_CERT="/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem"
+        SSL_KEY="/etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem"
+        SSL_IS_TRUSTED="yes"
+        log "Certificate issued -- the panel is trusted by browsers"
+    else
+        warn "Let's Encrypt could not verify ${PANEL_DOMAIN} (DNS not pointing here yet?)."
+        warn "Keeping the self-signed certificate. Once the A record resolves, run:"
+        warn "  certbot --nginx -d ${PANEL_DOMAIN}"
+    fi
+    systemctl reload nginx || true
 fi
 
 systemctl restart php8.3-fpm
@@ -739,10 +795,16 @@ sleep 3
 API_URL="${APP_URL}/api/application"
 WORKING_KEY=""
 
+# The panel is called over its own hostname so Laravel sees the URL it expects,
+# but resolved to this machine and with verification off: the domain's DNS may
+# not point here yet, and the certificate may be the self-signed one.
+API_HOST=${APP_URL#https://}
+CURL=(curl -sk --resolve "${API_HOST}:443:127.0.0.1")
+
 # Try both with and without ptla_ prefix
 for prefix in "" "ptla_"; do
     TEST_KEY="${prefix}${PANEL_API_KEY}"
-    HTTP_CODE=$(curl -s -o /tmp/api_resp.json -w "%{http_code}" \
+    HTTP_CODE=$("${CURL[@]}" -o /tmp/api_resp.json -w "%{http_code}" \
         "${API_URL}/users" \
         -H "Authorization: Bearer ${TEST_KEY}" \
         -H "Content-Type: application/json" \
@@ -786,14 +848,14 @@ api_call() {
     local response http_code body
     for attempt in 1 2 3 4 5; do
         if [ -n "$data" ]; then
-            response=$(curl -s -w "\n%{http_code}" -X "$method" \
+            response=$("${CURL[@]}" -w "\n%{http_code}" -X "$method" \
                 "${API_URL}${endpoint}" \
                 -H "$AUTH_HEADER" \
                 -H "Content-Type: application/json" \
                 -H "Accept: application/json" \
                 -d "$data")
         else
-            response=$(curl -s -w "\n%{http_code}" -X "$method" \
+            response=$("${CURL[@]}" -w "\n%{http_code}" -X "$method" \
                 "${API_URL}${endpoint}" \
                 -H "$AUTH_HEADER" \
                 -H "Content-Type: application/json" \
@@ -839,8 +901,18 @@ fi
 
 step "Creating node"
 
-SCHEME="http"
-[[ "$APP_URL" == https* ]] && SCHEME="https"
+# Wings must match the panel's scheme: a page served over HTTPS is not allowed
+# to open a plaintext websocket, so an http node means a dead console.
+SCHEME="https"
+
+# The node is addressed by the name its certificate is actually for. With a
+# trusted certificate that is the domain; otherwise the IP, which the
+# self-signed certificate carries as a SAN.
+if [ "$SSL_IS_TRUSTED" = "yes" ]; then
+    NODE_FQDN="$PANEL_DOMAIN"
+else
+    NODE_FQDN="$PUBLIC_IP"
+fi
 
 # Check if node already exists
 EXISTING_NODES=$(api_call GET "/nodes") || true
@@ -852,7 +924,7 @@ else
     NODE_RESPONSE=$(api_call POST "/nodes" "{
         \"name\": \"${NODE_NAME}\",
         \"location_id\": ${LOCATION_ID},
-        \"fqdn\": \"${PUBLIC_IP}\",
+        \"fqdn\": \"${NODE_FQDN}\",
         \"scheme\": \"${SCHEME}\",
         \"memory\": ${NODE_MEMORY_MB},
         \"memory_overallocate\": 0,
@@ -882,10 +954,18 @@ CONFIG_RESPONSE=$(api_call GET "/nodes/${NODE_ID}/configuration") || {
 }
 echo "$CONFIG_RESPONSE" | jq '.' > /dev/null 2>&1 || err "Invalid config JSON: $CONFIG_RESPONSE"
 
+# The panel writes /etc/letsencrypt/live/<fqdn>/ into the config regardless of
+# where the certificate really is, so point Wings at the one nginx is serving.
+WINGS_SSL_CERT="$SSL_CERT" WINGS_SSL_KEY="$SSL_KEY" \
 python3 - "$CONFIG_RESPONSE" <<'PYEOF'
-import json, sys
+import json, os, sys
 
 config = json.loads(sys.argv[1])
+
+ssl = config.setdefault("api", {}).setdefault("ssl", {})
+ssl["enabled"] = True
+ssl["cert"] = os.environ["WINGS_SSL_CERT"]
+ssl["key"] = os.environ["WINGS_SSL_KEY"]
 
 def to_yaml(obj, indent=0):
     lines = []
@@ -937,7 +1017,7 @@ create_alloc_range() {
     for p in $(seq "$start" "$end"); do A+="\"$p\","; done
     A="${A%,}]}"
     local RESP
-    RESP=$(curl -s -w "\n%{http_code}" -X POST \
+    RESP=$("${CURL[@]}" -w "\n%{http_code}" -X POST \
         "${API_URL}/nodes/${NODE_ID}/allocations" \
         -H "$AUTH_HEADER" \
         -H "Content-Type: application/json" \
@@ -1222,6 +1302,12 @@ step "Saving credentials to README"
 INSTALL_DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
 README_PATH="/root/pterodactyl-credentials.md"
 
+if [ "$SSL_IS_TRUSTED" = "yes" ]; then
+    SSL_IS_TRUSTED_LABEL="Let's Encrypt (trusted)"
+else
+    SSL_IS_TRUSTED_LABEL="self-signed -- your browser will warn once, and the console needs https://${PUBLIC_IP}:${WINGS_PORT} accepted too"
+fi
+
 cat > "$README_PATH" <<READMEOF
 # Pterodactyl Panel — Installation Credentials
 
@@ -1235,6 +1321,7 @@ cat > "$README_PATH" <<READMEOF
 | Field           | Value                       |
 |-----------------|-----------------------------|
 | **URL**         | ${APP_URL}                  |
+| **Certificate** | ${SSL_IS_TRUSTED_LABEL}     |
 | **Admin User**  | ${ADMIN_USER}               |
 | **Admin Email** | ${ADMIN_EMAIL}              |
 | **Password**    | ${ADMIN_PASSWORD}           |
@@ -1348,6 +1435,7 @@ echo -e "${GREEN}  PTERODACTYL INSTALLATION COMPLETE${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  Panel URL:        ${CYAN}${APP_URL}${NC}"
+echo -e "  Certificate:      ${CYAN}${SSL_IS_TRUSTED_LABEL}${NC}"
 echo -e "  Admin User:       ${CYAN}${ADMIN_USER}${NC}"
 echo -e "  Admin Email:      ${CYAN}${ADMIN_EMAIL}${NC}"
 echo -e "  Admin Password:   ${CYAN}the one you chose when ordering${NC}"
