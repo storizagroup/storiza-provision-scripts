@@ -7,19 +7,24 @@
 #
 # Dokploy has no supported way to create its first account without a browser:
 # whoever opens the dashboard first registers as the owner. There is nothing
-# to pre-seed, so this script does not pretend to -- it installs Dokploy, puts
-# TLS in front of the dashboard, and the instructions tell the customer to
-# register immediately.
+# to pre-seed, so this script does not pretend to -- it installs Dokploy and
+# the instructions tell the customer to register immediately.
 #
-# HTTPS: Dokploy runs Traefik on 80 and 443 for the applications the customer
-# deploys, so this script leaves those alone. nginx terminates TLS on 8443 in
-# front of the dashboard on 3000, so the registration form -- where the owner
-# password is chosen -- is never served in plaintext. With a domain, set it in
-# Dokploy's own Web Server settings afterwards and its proxy will issue a
-# Let's Encrypt certificate on 443.
+# Why the dashboard is not put behind TLS here:
 #
-# Ports: 80, 443 and 8443 only. 3000 is denied explicitly because Dokploy
-# publishes it through Docker, which bypasses the allow list.
+# Dokploy authenticates with better-auth, which refuses any request whose
+# Origin is not on a list it keeps in its own database. Serving the panel from
+# anywhere other than the address it knows about answers every login with
+# "Invalid Origin", and no proxy header can talk it round -- an allowlist is
+# not a header check. That list is written by the Settings -> Web Server page,
+# which also asks Dokploy's own Traefik for a Let's Encrypt certificate.
+#
+# So the dashboard is left where Dokploy puts it, on 3000, and the customer
+# gives it a domain from inside the panel. It is one click and it is the only
+# path that ends with both HTTPS and a working login.
+#
+# Ports: 80 and 443 for the applications the customer deploys, and 3000 for
+# the dashboard until it has a domain of its own.
 #
 # Upstream: https://dokploy.com  (Apache-2.0)
 # Installer: https://dokploy.com/install.sh
@@ -32,17 +37,22 @@ storiza_start "Dokploy" \
 	"Reading your answers" \
 	"Installing system dependencies" \
 	"Installing Dokploy" \
-	"Publishing the dashboard over HTTPS" \
 	"Closing the ports nothing should reach"
 
 step
 PANEL_DOMAIN=$(answer '.inputs.panel_domain')
+IP_ADDRESS=$(answer '.vps.ip.address')
+[ -n "$IP_ADDRESS" ] || IP_ADDRESS=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+[ -n "$IP_ADDRESS" ] || IP_ADDRESS=$(hostname -I | awk '{print $1}')
+[ -n "$IP_ADDRESS" ] || fail "This server has no address to publish Dokploy on."
+
+PANEL_URL="http://${IP_ADDRESS}:3000"
 
 step
-pkg curl nginx openssl
-# The installer aborts if anything holds port 3000, and nginx must not be on
-# 80 while Traefik claims it.
-systemctl stop nginx || true
+pkg curl
+# Dokploy's Traefik takes 80 and 443, and the installer stops if anything else
+# holds them. A leftover nginx default site is the usual culprit.
+systemctl disable --now nginx > /dev/null 2>&1 || true
 
 step
 echo "[storiza] running the Dokploy installer -- this takes several minutes"
@@ -51,14 +61,7 @@ sh /tmp/dokploy-install.sh || fail "The Dokploy installer did not finish."
 rm -f /tmp/dokploy-install.sh
 
 step
-# No domain passed on purpose: an http-01 challenge needs port 80, which
-# belongs to Dokploy's Traefik. Dokploy issues that certificate itself.
-serve_https 3000 8443
-[ -z "$PANEL_DOMAIN" ] || PANEL_URL="https://${PANEL_DOMAIN}:8443"
-
-step
-allow_ports 80/tcp 443/tcp 8443/tcp
-deny_ports 3000/tcp
+allow_ports 80/tcp 443/tcp 3000/tcp
 
 credentials <<CREDS
 # Dokploy
@@ -71,13 +74,20 @@ credentials <<CREDS
 Open the URL and register now. Until you do, anyone who finds this server can
 claim it.
 
-The certificate is ${CERT_NOTE}. To get a real one, point a domain at this
-server and set it under Web Server -> Domain in Dokploy; its own proxy will
-issue a Let's Encrypt certificate on 443.
+## Then give it a domain
 
-Ports 80 and 443 belong to Dokploy's proxy, which routes the applications you
-deploy. Leave them to it. Everything else is closed -- open what you need with
-\`ufw allow <port>\`.
+The dashboard is on plain HTTP until it has one, because Dokploy only trusts
+logins coming from an address it knows about, and that address is set from
+inside the panel. Point ${PANEL_DOMAIN:-a domain} at ${IP_ADDRESS}, then open
+Settings -> Web Server, set the domain and enable HTTPS. Dokploy adds it to
+its trusted origins and asks Let's Encrypt for a certificate, and the panel
+moves to 443.
+
+Until then, treat that first login as one you are making on an untrusted
+network: it is not encrypted.
+
+Ports 80 and 443 route the applications you deploy. Everything else is closed
+-- open what you need with \`ufw allow <port>\`.
 CREDS
 
 echo "[storiza] Dokploy ready at ${PANEL_URL} -- register the owner account now"

@@ -268,7 +268,13 @@ certbot_try() {
 #
 # Puts nginx in front of something already listening on localhost: TLS
 # terminated on the public port (443 unless you say otherwise), proxying to
-# the app port. With a domain it also redirects 80 and asks Let's Encrypt for
+# the app port.
+#
+# Not for a product that ships its own reverse proxy. Coolify, Dokploy and
+# Easypanel all decide what their own address is and then check requests
+# against it -- asset URLs built from it, an Origin allowlist keyed to it --
+# so serving them from anywhere else gives you a panel that argues with
+# itself. Those are configured through their own settings instead. With a domain it also redirects 80 and asks Let's Encrypt for
 # a real certificate; without one the self-signed certificate stands, because
 # a browser warning beats a password crossing the network in the clear.
 #
@@ -325,7 +331,12 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:${app};
-        proxy_set_header Host \$host;
+        # \$http_host, not \$host: it keeps the port. An application published
+        # on anything but 443 compares this against the browser's Origin, and
+        # rejects itself when the two disagree.
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Port ${public};
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;

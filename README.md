@@ -100,7 +100,7 @@ pkg curl nginx openssl
 | `pkg` | apt, quiet and non-interactive, updating the lists once per run |
 | `supported_ubuntu 22.04 24.04` | stop early rather than half-install where the vendor will refuse |
 | `self_signed` / `certbot_try` | a certificate for an IP or a name, upgraded to Let's Encrypt where the DNS already points here |
-| `serve_https 8000 8443` | both of those plus an nginx vhost: TLS on 8443, proxying to the app on 8000 |
+| `serve_https 23333` | both of those plus an nginx vhost in front of a local port. Not for a product that ships its own reverse proxy -- see below |
 | `allow_ports` / `deny_ports` | see below |
 | `credentials <<EOF` | writes `/root/<product>-credentials.md`, chmod 600 |
 
@@ -161,18 +161,24 @@ directory rather than bending an existing name.
 | [`panels/webpanels/cloudpanel.sh`](panels/webpanels/cloudpanel.sh) | CloudPanel, admin account created via `clpctl` | `8443` |
 | [`panels/webpanels/cyberpanel.sh`](panels/webpanels/cyberpanel.sh) | CyberPanel (OpenLiteSpeed), silent install | `8090` |
 | [`panels/webpanels/cpanel.sh`](panels/webpanels/cpanel.sh) | cPanel & WHM — **licence required, not included** | `2087` |
-| [`panels/paas/coolify.sh`](panels/paas/coolify.sh) | Coolify, root user seeded from the payload | `443` or `8443` |
-| [`panels/paas/dokploy.sh`](panels/paas/dokploy.sh) | Dokploy, behind nginx | `8443` |
-| [`panels/paas/easypanel.sh`](panels/paas/easypanel.sh) | Easypanel, behind nginx | `8443` |
+| [`panels/paas/coolify.sh`](panels/paas/coolify.sh) | Coolify, root user seeded from the payload, dashboard address registered | `443` |
+| [`panels/paas/dokploy.sh`](panels/paas/dokploy.sh) | Dokploy | `3000`, then `443` once it has a domain |
+| [`panels/paas/easypanel.sh`](panels/paas/easypanel.sh) | Easypanel | `3000`, then `443` once it has a domain |
 | [`applications/cms/wordpress.sh`](applications/cms/wordpress.sh) | WordPress on NGINX + PHP-FPM + MariaDB, install completed | `443` |
 
 Every one of them serves its panel over HTTPS: Let's Encrypt where a domain was answered
 and the panel does not manage its own certificates, self-signed otherwise. Panels that
 already ship their own TLS (CloudPanel, CyberPanel, cPanel) keep theirs.
 
-A note on ports 80 and 443: Coolify, Dokploy and Easypanel run their own proxy there to
-serve the applications you deploy, so those scripts put the dashboard on `8443` instead of
-taking 443 away from them.
+A note on the three PaaS panels. Coolify, Dokploy and Easypanel each ship their own
+reverse proxy on 80 and 443 to serve the applications you deploy, and each decides what
+its own address is and then checks requests against it -- asset URLs built from it, an
+Origin allowlist keyed to it. Serving one of them from anywhere else gives you a panel
+that argues with itself, so these scripts configure the panel's own address rather than
+putting nginx in front of it. Coolify's is registered during the install and its
+dashboard comes up on 443; Dokploy and Easypanel keep theirs on 3000 until the customer
+sets a domain from inside the panel, which is the only thing that gets them onto 443 with
+a certificate and a login that works.
 
 ## Tests
 

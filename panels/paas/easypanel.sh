@@ -9,15 +9,21 @@
 # without a browser: the first visitor becomes the owner. The instructions say
 # to register immediately.
 #
-# HTTPS: Easypanel's own installer refuses to run if anything is listening on
-# port 80 or 443 -- it needs both for its Traefik, which routes the customer's
-# applications and issues their certificates. So nginx here binds 8443 only,
-# terminating TLS in front of the dashboard on 3000 so the registration form
-# is not served in plaintext. Setting a domain inside Easypanel afterwards
-# gets the dashboard a real certificate on 443 from its own proxy.
+# Why the dashboard is not put behind TLS here:
 #
-# Ports: 80, 443 and 8443 only. 3000 is denied explicitly because Easypanel
-# publishes it through Docker, which bypasses the allow list.
+# Easypanel runs its own Traefik on 80 and 443 for the applications the
+# customer deploys, and expects to serve its own dashboard through it once the
+# panel has been told which domain it answers on. Putting another web server
+# in front on a side port gives the panel an address it does not know about,
+# and a dashboard that argues with itself about where it lives -- assets on
+# the wrong port, sessions that will not stick.
+#
+# So the dashboard is left where Easypanel puts it, on 3000, and the customer
+# sets a domain from inside the panel, which is one click and gets a real
+# certificate from Easypanel's own proxy.
+#
+# Ports: 80 and 443 for the applications the customer deploys, and 3000 for
+# the dashboard until it has a domain of its own.
 #
 # Upstream: https://easypanel.io
 # Installer: https://get.easypanel.io
@@ -30,18 +36,22 @@ storiza_start "Easypanel" \
 	"Reading your answers" \
 	"Installing system dependencies" \
 	"Installing Easypanel" \
-	"Publishing the dashboard over HTTPS" \
 	"Closing the ports nothing should reach"
 
 step
 PANEL_DOMAIN=$(answer '.inputs.panel_domain')
+IP_ADDRESS=$(answer '.vps.ip.address')
+[ -n "$IP_ADDRESS" ] || IP_ADDRESS=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+[ -n "$IP_ADDRESS" ] || IP_ADDRESS=$(hostname -I | awk '{print $1}')
+[ -n "$IP_ADDRESS" ] || fail "This server has no address to publish Easypanel on."
+
+PANEL_URL="http://${IP_ADDRESS}:3000"
 
 step
-pkg curl nginx openssl lsof
+pkg curl lsof
 # The installer checks 80 and 443 with lsof and exits if either is taken, so
-# nginx has to be out of the way before it runs -- and must never come back on
-# those ports afterwards.
-systemctl stop nginx || true
+# nothing of ours may be holding them when it runs.
+systemctl disable --now nginx > /dev/null 2>&1 || true
 
 step
 echo "[storiza] running the Easypanel installer -- this takes several minutes"
@@ -50,14 +60,7 @@ sh /tmp/easypanel-install.sh || fail "The Easypanel installer did not finish."
 rm -f /tmp/easypanel-install.sh
 
 step
-# No domain passed on purpose: an http-01 challenge needs port 80, which
-# belongs to Easypanel's Traefik. Easypanel issues that certificate itself.
-serve_https 3000 8443
-[ -z "$PANEL_DOMAIN" ] || PANEL_URL="https://${PANEL_DOMAIN}:8443"
-
-step
-allow_ports 80/tcp 443/tcp 8443/tcp
-deny_ports 3000/tcp
+allow_ports 80/tcp 443/tcp 3000/tcp
 
 credentials <<CREDS
 # Easypanel
@@ -70,12 +73,19 @@ credentials <<CREDS
 Open the URL and register now. Until you do, anyone who finds this server can
 claim it.
 
-The certificate is ${CERT_NOTE}. Point a domain at this server and set it in
-Easypanel's settings to get a real one on 443.
+## Then give it a domain
 
-Ports 80 and 443 belong to Easypanel's proxy, which routes the applications
-you deploy. Leave them to it. Everything else is closed -- open what you need
-with \`ufw allow <port>\`.
+The dashboard is on plain HTTP until it has one, because Easypanel serves it
+through its own proxy and only once it knows which domain to answer on. Point
+${PANEL_DOMAIN:-a domain} at ${IP_ADDRESS}, then set it in Easypanel's
+settings: its proxy asks Let's Encrypt for a certificate and the panel moves
+to 443.
+
+Until then, treat that first login as one you are making on an untrusted
+network: it is not encrypted.
+
+Ports 80 and 443 route the applications you deploy. Everything else is closed
+-- open what you need with \`ufw allow <port>\`.
 CREDS
 
 echo "[storiza] Easypanel ready at ${PANEL_URL} -- register the owner account now"
