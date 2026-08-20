@@ -2,15 +2,10 @@
 #
 # MCSManager -- Storiza provision script.
 #
-# Run once by cloud-init while a Storiza VPS first boots. The customer's
-# answers arrive in a file, never as arguments:
-#
-#     /etc/storiza/provision.json   { "vps": {...}, "inputs": {...} }
-#
 # Inputs consumed:
 #     inputs.panel_domain    -- optional; the panel answers on the IP without it
 #
-# ⚠ MCSManager creates its administrator through the browser on first visit.
+# MCSManager creates its administrator through the browser on first visit.
 # There is no supported way to pre-seed it, so the instructions tell the
 # customer to open the panel and claim it immediately.
 #
@@ -21,51 +16,58 @@
 # HTTPS: MCSManager serves plain HTTP on 23333, and it is a panel that hands
 # out server consoles and file access, so nginx terminates TLS in front of it
 # -- Let's Encrypt when a domain was answered and its DNS already points here,
-# self-signed otherwise. 23333 is left bound to localhost.
+# self-signed otherwise.
+#
+# Ports: no allow list. This is a game panel; the whole point is that the
+# customer opens 25565 and whatever else their servers need. Instead the two
+# ports that must never be reached from outside are closed -- 23333, which is
+# the panel in plaintext, and 24444, the daemon that the panel talks to over
+# localhost.
 #
 # Upstream: https://mcsmanager.com  (Apache-2.0, MCSManager)
 # Release: https://github.com/MCSManager/MCSManager/releases
 set -euo pipefail
 
-LOG=/var/log/storiza-provision.log
-exec > >(tee -a "$LOG") 2>&1
-echo "[storiza] MCSManager provisioning started $(date -Is)"
+curl -fsSL https://raw.githubusercontent.com/storizagroup/storiza-provision-scripts/main/lib/provision.sh \
+	-o /tmp/storiza-lib.sh && . /tmp/storiza-lib.sh
 
-DATA=${PROVISION_DATA:-/etc/storiza/provision.json}
-[ -r "$DATA" ] || { echo "[storiza] $DATA missing -- nothing to install"; exit 1; }
-
-command -v jq >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y jq >/dev/null; }
-answer() { jq -r "$1 // empty" "$DATA"; }
-
-PANEL_DOMAIN=$(answer '.inputs.panel_domain')
-IP_ADDRESS=$(answer '.vps.ip.address')
+storiza_start "MCSManager" \
+	"Reading your answers" \
+	"Installing Java and Node.js" \
+	"Downloading MCSManager" \
+	"Installing its dependencies" \
+	"Starting the panel" \
+	"Publishing the panel over HTTPS" \
+	"Closing the panel's own ports"
 
 INSTALL_DIR=/opt/mcsmanager
 RELEASE_URL=https://github.com/MCSManager/MCSManager/releases/latest/download/mcsmanager_linux_release.tar.gz
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y curl wget tar nginx openssl certbot python3-certbot-nginx openjdk-21-jre-headless >/dev/null
+step
+PANEL_DOMAIN=$(answer '.inputs.panel_domain')
 
+step
+pkg curl wget tar openjdk-21-jre-headless
 # Ubuntu 24.04 ships Node 18; MCSManager needs 20 or newer.
-if ! node --version 2>/dev/null | grep -qE "^v(2[0-9]|[3-9][0-9])\."; then
+if ! node --version 2> /dev/null | grep -qE "^v(2[0-9]|[3-9][0-9])\."; then
 	echo "[storiza] installing Node.js 20"
 	curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource.sh
-	bash /tmp/nodesource.sh >/dev/null
-	apt-get install -y nodejs >/dev/null
+	bash /tmp/nodesource.sh > /dev/null
+	pkg nodejs
 	rm -f /tmp/nodesource.sh
 fi
 
-echo "[storiza] downloading MCSManager"
+step
 mkdir -p "$INSTALL_DIR"
 curl -fsSL "$RELEASE_URL" -o /tmp/mcsmanager.tar.gz
 tar -xzf /tmp/mcsmanager.tar.gz -C "$INSTALL_DIR" --strip-components 1
 rm -f /tmp/mcsmanager.tar.gz
 
-echo "[storiza] installing dependencies"
-(cd "$INSTALL_DIR/daemon" && npm install --production --no-fund --no-audit >/dev/null)
-(cd "$INSTALL_DIR/web" && npm install --production --no-fund --no-audit >/dev/null)
+step
+(cd "$INSTALL_DIR/daemon" && npm install --production --no-fund --no-audit > /dev/null)
+(cd "$INSTALL_DIR/web" && npm install --production --no-fund --no-audit > /dev/null)
 
+step
 for unit in daemon web; do
 	port=24444
 	[ "$unit" = "web" ] && port=23333
@@ -86,73 +88,16 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 UNIT
 done
-
 systemctl daemon-reload
 systemctl enable --now mcsm-daemon mcsm-web
 
-# ── TLS in front of the panel ───────────────────────────────────────────────
-mkdir -p /etc/storiza/ssl
-SAN="IP:${IP_ADDRESS}"
-[ -n "$PANEL_DOMAIN" ] && SAN="DNS:${PANEL_DOMAIN},${SAN}"
-openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -sha256 \
-	-keyout /etc/storiza/ssl/self.key -out /etc/storiza/ssl/self.crt \
-	-subj "/CN=${PANEL_DOMAIN:-$IP_ADDRESS}" -addext "subjectAltName=${SAN}" 2>/dev/null
-chmod 600 /etc/storiza/ssl/self.key
+step
+serve_https 23333 443 "$PANEL_DOMAIN"
 
-cat > /etc/nginx/sites-available/mcsmanager.conf <<NGINX
-server {
-    listen 80;
-    server_name ${PANEL_DOMAIN:-_};
+step
+deny_ports 23333/tcp 24444/tcp
 
-    location ^~ /.well-known/acme-challenge/ { root /var/www/html; }
-    location / { return 301 https://\$host\$request_uri; }
-}
-
-server {
-    listen 443 ssl;
-    server_name ${PANEL_DOMAIN:-_};
-
-    ssl_certificate     /etc/storiza/ssl/self.crt;
-    ssl_certificate_key /etc/storiza/ssl/self.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-
-    client_max_body_size 2048m;
-
-    location / {
-        proxy_pass http://127.0.0.1:23333;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-    }
-}
-NGINX
-rm -f /etc/nginx/sites-enabled/default
-ln -sf /etc/nginx/sites-available/mcsmanager.conf /etc/nginx/sites-enabled/mcsmanager.conf
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
-
-CERT_NOTE="self-signed -- the browser warns once"
-if [ -n "$PANEL_DOMAIN" ]; then
-	echo "[storiza] requesting a Let's Encrypt certificate for ${PANEL_DOMAIN}"
-	if certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos \
-		--register-unsafely-without-email --redirect --keep-until-expiring; then
-		CERT_NOTE="Let's Encrypt (trusted)"
-	else
-		echo "[storiza] Let's Encrypt could not verify ${PANEL_DOMAIN} -- keeping the self-signed certificate"
-		echo "[storiza] once its A record resolves here, run: certbot --nginx -d ${PANEL_DOMAIN}"
-	fi
-	systemctl reload nginx || true
-fi
-
-PANEL_URL="https://${PANEL_DOMAIN:-$IP_ADDRESS}"
-
-cat > /root/mcsmanager-credentials.md <<CREDS
+credentials <<CREDS
 # MCSManager
 
 | | |
@@ -161,13 +106,14 @@ cat > /root/mcsmanager-credentials.md <<CREDS
 | Account | none yet -- the first visitor creates the administrator |
 | Certificate | ${CERT_NOTE} |
 
-⚠ Open the URL and create the administrator now. Until you do, anyone who
-finds this server can claim it.
+Open the URL and create the administrator now. Until you do, anyone who finds
+this server can claim it.
 
-Java 21 is installed for Minecraft servers. The panel is on 443; the daemon
-listens on 24444 for the panel itself.
+Java 21 is installed for Minecraft servers. The panel answers on 443; 23333
+and 24444 are closed from outside, which is where the panel and its daemon
+talk to each other.
+
+Game server ports are yours to open -- \`ufw allow 25565/tcp\` and so on.
 CREDS
-chmod 600 /root/mcsmanager-credentials.md
 
 echo "[storiza] MCSManager ready at ${PANEL_URL} -- create the administrator now"
-echo "[storiza] MCSManager provisioning finished $(date -Is)"

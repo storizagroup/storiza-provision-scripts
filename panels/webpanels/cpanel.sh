@@ -2,21 +2,16 @@
 #
 # cPanel & WHM -- Storiza provision script.
 #
-# Run once by cloud-init while a Storiza VPS first boots. The customer's
-# answers arrive in a file, never as arguments:
-#
-#     /etc/storiza/provision.json   { "vps": {...}, "inputs": {...} }
-#
 # Inputs consumed:
 #     inputs.server_hostname  -- fully qualified, required (see below)
 #
-# ⚠ cPanel & WHM is commercial software published by cPanel, L.L.C. It is not
+# cPanel & WHM is commercial software published by cPanel, L.L.C. It is not
 # free and no licence is included with the server: the install starts a trial
 # if the IP qualifies, and after that a licence has to be bought from cPanel
 # or a partner. This script only runs the vendor's own public installer; it
 # does not bundle, modify or unlock anything.
 #
-# ⚠ The hostname must be a fully qualified domain name that is NOT the same as
+# The hostname must be a fully qualified domain name that is NOT the same as
 # any domain you plan to host on the server (cPanel refuses to add a domain
 # that matches the hostname). Something like server.example.com. The installer
 # checks this before it does anything expensive, and so does this script.
@@ -26,60 +21,54 @@
 # added in front of it -- cPanel manages ports 80, 443, 2083 and 2087 itself,
 # and a second web server would fight it.
 #
+# Ports: deliberately not touched. cPanel ships its own firewall expectations
+# across mail, DNS, FTP and its four web ports, and hosts commonly add CSF on
+# top. An allow list written here would fight all of that.
+#
 # Upstream: https://cpanel.net
 # Installer: https://securedownloads.cpanel.net/latest
 set -euo pipefail
 
-LOG=/var/log/storiza-provision.log
-exec > >(tee -a "$LOG") 2>&1
-echo "[storiza] cPanel provisioning started $(date -Is)"
+curl -fsSL https://raw.githubusercontent.com/storizagroup/storiza-provision-scripts/main/lib/provision.sh \
+	-o /tmp/storiza-lib.sh && . /tmp/storiza-lib.sh
 
-DATA=${PROVISION_DATA:-/etc/storiza/provision.json}
-[ -r "$DATA" ] || { echo "[storiza] $DATA missing -- nothing to install"; exit 1; }
+storiza_start "cPanel" \
+	"Reading your answers" \
+	"Checking the server is empty" \
+	"Setting the hostname" \
+	"Installing cPanel & WHM"
 
-command -v jq >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y jq >/dev/null; }
-answer() { jq -r "$1 // empty" "$DATA"; }
-
-SERVER_HOSTNAME=$(answer '.inputs.server_hostname')
+step
+SERVER_HOSTNAME=$(need '.inputs.server_hostname')
 IP_ADDRESS=$(answer '.vps.ip.address')
-
-[ -n "$SERVER_HOSTNAME" ] || {
-	echo "[storiza] inputs.server_hostname is required and must be a fully qualified name"
-	exit 1
-}
 case "$SERVER_HOSTNAME" in
 	*.*.*) ;;
-	*)
-		echo "[storiza] '${SERVER_HOSTNAME}' is not fully qualified -- cPanel needs something like server.example.com"
-		exit 1
-		;;
+	*) fail "'${SERVER_HOSTNAME}' is not a fully qualified name -- cPanel needs something like server.example.com." ;;
 esac
 
+step
 # cPanel installs on a bare machine and manages the stack itself. Anything we
 # add first -- a web server, a database -- makes the install fail.
 for blocker in nginx apache2 mysql-server mariadb-server; do
-	if dpkg -l "$blocker" 2>/dev/null | grep -q "^ii"; then
-		echo "[storiza] ${blocker} is installed; cPanel requires a clean server"
-		exit 1
+	if dpkg -l "$blocker" 2> /dev/null | grep -q "^ii"; then
+		fail "${blocker} is already installed, and cPanel requires a clean server."
 	fi
 done
+pkg curl perl
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y curl perl >/dev/null
-
+step
 hostnamectl set-hostname "$SERVER_HOSTNAME"
-if ! grep -q "$SERVER_HOSTNAME" /etc/hosts; then
-	echo "${IP_ADDRESS} ${SERVER_HOSTNAME} ${SERVER_HOSTNAME%%.*}" >> /etc/hosts
-fi
+grep -q "$SERVER_HOSTNAME" /etc/hosts \
+	|| echo "${IP_ADDRESS} ${SERVER_HOSTNAME} ${SERVER_HOSTNAME%%.*}" >> /etc/hosts
 
+step
 echo "[storiza] running the cPanel installer -- this takes 30-60 minutes"
 cd /home
 curl -fsSL -o latest https://securedownloads.cpanel.net/latest
-sh latest
+sh latest || fail "The cPanel installer did not finish."
 rm -f /home/latest
 
-cat > /root/cpanel-credentials.md <<CREDS
+credentials <<CREDS
 # cPanel & WHM
 
 | | |
@@ -100,7 +89,5 @@ one.
 The certificate is self-signed until AutoSSL replaces it, which needs
 ${SERVER_HOSTNAME} to resolve to ${IP_ADDRESS}.
 CREDS
-chmod 600 /root/cpanel-credentials.md
 
 echo "[storiza] WHM ready at https://${IP_ADDRESS}:2087 -- sign in as root"
-echo "[storiza] cPanel provisioning finished $(date -Is)"
