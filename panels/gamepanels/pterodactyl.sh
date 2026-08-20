@@ -319,7 +319,9 @@ class StorizaApiKey extends Command
 PHPCMD
 
 php artisan clear-compiled > /dev/null 2>&1 || true
-PANEL_API_KEY=$(php artisan p:storiza:apikey --no-interaction 2> /dev/null | tr -d '[:space:]')
+# stderr is left alone: when artisan refuses, its reason is the only thing
+# that explains an empty key.
+PANEL_API_KEY=$(php artisan p:storiza:apikey --no-interaction | tr -d '[:space:]')
 rm -f app/Console/Commands/StorizaApiKey.php
 php artisan clear-compiled > /dev/null 2>&1 || true
 [ -n "$PANEL_API_KEY" ] || fail "The panel installed, but its API key could not be created."
@@ -542,7 +544,7 @@ class StorizaEggs extends Command
 PHPCMD
 
 php artisan clear-compiled > /dev/null 2>&1 || true
-echo "[storiza] eggs: $(php artisan p:storiza:eggs --no-interaction 2> /dev/null || echo 'import skipped')"
+echo "[storiza] eggs: $(php artisan p:storiza:eggs --no-interaction || echo 'import skipped')"
 rm -f app/Console/Commands/StorizaEggs.php
 php artisan clear-compiled > /dev/null 2>&1 || true
 

@@ -71,7 +71,9 @@ run 'step; step; false'
 check "still reaches a terminal state" "failed" \
 	"$(sed 's/.*"state":"\([a-z]*\)".*/\1/' "$STATE_DIR/state")"
 check "names the step that died" "yes" \
-	"$(grep -q 'quoted.* step failed (exit 1)' "$STATE_DIR/state" && echo yes || echo no)"
+	"$(grep -q 'quoted.* step failed' "$STATE_DIR/state" && echo yes || echo no)"
+check "names the command that died" "yes" \
+	"$(grep -q 'at: false (exit 1)' "$STATE_DIR/state" && echo yes || echo no)"
 
 echo "a run with no payload"
 mkdir -p "$ROOT/bare"

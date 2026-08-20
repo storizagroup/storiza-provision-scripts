@@ -39,7 +39,7 @@
 #   deny_ports      close these, leave the rest alone
 #   credentials     the /root/<product>-credentials.md file, chmod 600
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 STORIZA_DIR=${STORIZA_DIR:-/var/lib/storiza}
 PROVISION_DATA=${PROVISION_DATA:-$STORIZA_DIR/provision.json}
@@ -53,6 +53,8 @@ _STEPS=()
 _STEP=0
 _FAIL=""
 _DENIED=""
+_ERR_CMD=""
+_ERR_LINE=""
 
 # -- protocol --------------------------------------------------------------
 
@@ -72,15 +74,25 @@ _state() {
 
 _finish() {
 	local code=$1 why
-	trap - EXIT
+	trap - EXIT ERR
 	if [ "$code" -eq 0 ]; then
 		echo "[storiza] $_NAME provisioning finished $(date -Is)"
 		_state completed "$_STEP" null
-	else
-		why=${_FAIL:-"${_STEPS[$((_STEP - 1))]:-Provisioning} failed (exit $code) -- see the log"}
-		echo "[storiza] FAILED: $why" >&2
-		_state failed "$_STEP" "\"$(_esc "$why")\""
+		return
 	fi
+
+	# A reason the script wrote itself beats anything guessed from the exit
+	# code. Failing that, name the command that died: "step 4 failed" sends
+	# somebody to read a log, "failed at: openssl req -x509 ..." does not.
+	why=$_FAIL
+	if [ -z "$why" ]; then
+		why="${_STEPS[$((_STEP - 1))]:-Provisioning} failed"
+		[ -z "$_ERR_CMD" ] || why="${why} at: $(printf '%.140s' "$_ERR_CMD")"
+		why="${why} (exit ${code})"
+	fi
+
+	echo "[storiza] FAILED${_ERR_LINE:+ on line $_ERR_LINE}: $why" >&2
+	_state failed "$_STEP" "\"$(_esc "$why")\""
 }
 
 # storiza_start "Coolify" "First step" "Second step" ...
@@ -108,6 +120,10 @@ storiza_start() {
 
 	_state running 0 null
 	trap '_finish $?' EXIT
+	# set -E above carries this into functions, so a command that dies deep in
+	# the library is still named. It does not fire for anything guarded by ||
+	# or tested by if, which is what makes it worth reporting.
+	trap '_ERR_CMD=$BASH_COMMAND; _ERR_LINE=$LINENO' ERR
 
 	# From here on, everything printed lands in the log as well as on the
 	# console where cloud-init keeps it. Started before the first apt call on
@@ -162,8 +178,14 @@ need() {
 
 pkg() {
 	export DEBIAN_FRONTEND=noninteractive
-	[ -n "${_APT_UPDATED:-}" ] || { apt-get update -qq && _APT_UPDATED=1; }
-	apt-get install -y -qq "$@" > /dev/null
+	# The lock timeout is for first boot: unattended-upgrades holds dpkg for
+	# minutes, and waiting for it beats failing an install over it.
+	local apt=(apt-get -o DPkg::Lock::Timeout=300 -qq)
+	[ -n "${_APT_UPDATED:-}" ] || { "${apt[@]}" update && _APT_UPDATED=1; }
+	# Nothing is thrown away here on purpose. dpkg reports a package whose
+	# service failed to start on stdout, and that is exactly the sentence
+	# somebody needs when an install dies.
+	"${apt[@]}" install -y "$@"
 }
 
 # Call after adding an apt repository, so the next pkg re-reads the lists.
@@ -187,17 +209,26 @@ supported_ubuntu() {
 # SSL_CERT, SSL_KEY and CERT_NOTE.
 self_signed() {
 	local host=$1 san
+	# openssl rejects an empty CN and an empty SAN, and an empty host here
+	# means an order that arrived without an address. Say that, rather than
+	# letting openssl fail with its own wording.
+	[ -n "$host" ] || fail "This server has no address to put a certificate on."
 	pkg openssl
 	case "$host" in
 		*[a-zA-Z]*) san="DNS:$host" ;;
 		*) san="IP:$host" ;;
 	esac
-	[ -n "${2:-}" ] && [ "$2" != "$host" ] && san="${san},IP:$2"
+	if [ -n "${2:-}" ] && [ "$2" != "$host" ]; then
+		san="${san},IP:$2"
+	fi
 
 	mkdir -p "$STORIZA_SSL"
+	# stderr is not silenced: openssl explains itself well, and this used to
+	# be the one command in the library that could fail without a trace.
 	openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -sha256 \
 		-keyout "$STORIZA_SSL/self.key" -out "$STORIZA_SSL/self.crt" \
-		-subj "/CN=${host}" -addext "subjectAltName=${san}" 2> /dev/null
+		-subj "/CN=${host}" -addext "subjectAltName=${san}" \
+		|| fail "A certificate for ${host} could not be created -- see the log."
 	chmod 600 "$STORIZA_SSL/self.key"
 
 	SSL_CERT="$STORIZA_SSL/self.crt"
@@ -250,6 +281,13 @@ serve_https() {
 	local app=$1 public=${2:-443} domain=${3:-} ip conf=/etc/nginx/sites-available/storiza.conf
 
 	ip=$(answer '.vps.ip.address')
+	# An order can reach a machine whose address the payload does not carry --
+	# NAT, a datacenter that assigns late. Ask the machine itself before
+	# giving up on it.
+	[ -n "$ip" ] || ip=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+	[ -n "$ip" ] || ip=$(hostname -I | awk '{print $1}')
+	[ -n "$ip" ] || fail "This server has no address to publish ${_NAME} on."
+
 	pkg nginx
 	self_signed "${domain:-$ip}" "$ip"
 
@@ -300,11 +338,18 @@ server {
 NGINX
 
 	mkdir -p /var/www/html
+	# The stock default site listens on 80. On a host where something else --
+	# Traefik, usually -- already has 80, leaving it enabled means nginx
+	# refuses to start, with a config that tests perfectly fine.
 	rm -f /etc/nginx/sites-enabled/default
 	ln -sf "$conf" /etc/nginx/sites-enabled/storiza.conf
-	nginx -t
-	systemctl enable --now nginx
-	systemctl restart nginx
+
+	nginx -t || fail "nginx rejected the configuration for ${_NAME} -- see the log."
+	systemctl unmask nginx > /dev/null 2>&1 || true
+	systemctl enable --now nginx \
+		|| fail "nginx would not start -- something may already be listening on ${public}. See the log."
+	systemctl restart nginx \
+		|| fail "nginx would not restart with the ${_NAME} configuration -- see the log."
 
 	PANEL_URL="https://${domain:-$ip}"
 	[ "$public" = 443 ] || PANEL_URL="${PANEL_URL}:${public}"
