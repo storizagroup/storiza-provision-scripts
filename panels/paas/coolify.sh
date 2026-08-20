@@ -23,8 +23,10 @@
 #   * with a domain -- Traefik's letsencrypt resolver issues a real
 #     certificate for it, which is how upstream intends this to work.
 #   * without one -- no certificate authority will vouch for an IP address, so
-#     Traefik serves a self-signed certificate. The browser warns once, which
-#     beats a password crossing the network in the clear.
+#     Traefik answers with the certificate it generates for itself. The
+#     browser warns once, which beats a password crossing the network in the
+#     clear. Point a domain at the server and set it under Settings to replace
+#     it with a real one.
 #
 # Either way port 80 redirects to 443 at the proxy, and 8000 -- the
 # dashboard's own plaintext port -- is closed to the internet, so there is no
@@ -60,7 +62,7 @@ PANEL_HOST="${PANEL_DOMAIN:-$IP_ADDRESS}"
 PANEL_URL="https://${PANEL_HOST}"
 
 step
-pkg curl openssl
+pkg curl
 # Ports 80 and 443 belong to Coolify's Traefik. Anything else holding them
 # stops the installer, and a leftover nginx default site is the usual culprit.
 systemctl disable --now nginx > /dev/null 2>&1 || true
@@ -76,7 +78,7 @@ rm -f /tmp/coolify-install.sh
 
 step
 [ -d "$PROXY_DIR" ] || fail "Coolify installed without its proxy directory -- nothing to configure."
-mkdir -p "$PROXY_DIR/certs" "$PROXY_DIR/dynamic"
+mkdir -p "$PROXY_DIR/dynamic"
 
 if [ -n "$PANEL_DOMAIN" ]; then
 	# Traefik asks Let's Encrypt the first time the domain is requested, and
@@ -85,12 +87,13 @@ if [ -n "$PANEL_DOMAIN" ]; then
 	ROUTER_TLS="{certResolver: letsencrypt}"
 	CERT_NOTE="Let's Encrypt, issued by Coolify's proxy once ${PANEL_DOMAIN} resolves here"
 else
-	# The certificate lives where the proxy container can read it: Coolify
-	# mounts /data/coolify/proxy as /traefik inside it.
-	STORIZA_SSL="$PROXY_DIR/certs"
-	self_signed "$PANEL_HOST"
-	chmod 644 "$PROXY_DIR/certs/self.crt"
+	# No certificate is made here. An empty tls block puts the router on the
+	# https entrypoint and lets Traefik answer with the certificate it
+	# generates for itself, which is untrusted but encrypted -- and no
+	# authority would vouch for an IP address anyway. One less command that
+	# can fail on the way to a working dashboard.
 	ROUTER_TLS="{}"
+	CERT_NOTE="Traefik's own -- encrypted, but the browser warns because nothing vouches for an IP address"
 fi
 
 # Named storiza-* so that setting an instance domain from Coolify's own
@@ -98,20 +101,9 @@ fi
 # with them.
 cat > "$PROXY_DIR/dynamic/storiza.yaml" <<YAML
 # Written by Storiza when this server was provisioned. Serving the dashboard
-# over TLS is all this does; delete it once you set an instance domain from
-# Settings and let Coolify manage its own routing.
-$([ -n "$PANEL_DOMAIN" ] || cat <<CERTS
-tls:
-  stores:
-    default:
-      defaultCertificate:
-        certFile: /traefik/certs/self.crt
-        keyFile: /traefik/certs/self.key
-  certificates:
-    - certFile: /traefik/certs/self.crt
-      keyFile: /traefik/certs/self.key
-CERTS
-)
+# over TLS is all this does. Setting an instance domain from Settings adds
+# Coolify's own routing beside it; this file only ever matches ${PANEL_HOST},
+# so it can stay or go as you prefer.
 http:
   middlewares:
     storiza-https:
@@ -161,8 +153,9 @@ if [ -f "$SOURCE_DIR/.env" ]; then
 		|| echo "[storiza] Coolify did not restart cleanly -- the dashboard may need a moment"
 fi
 
-# Traefik watches the dynamic directory, but a restart makes the certificate
-# store take effect deterministically rather than on its next reload.
+# Traefik picks up the dynamic directory on its own, but Coolify was just
+# recreated above and a restart puts the proxy back in front of it without
+# waiting for anything to notice.
 docker restart coolify-proxy > /dev/null 2>&1 \
 	|| echo "[storiza] the proxy did not restart -- check: docker logs coolify-proxy"
 
@@ -187,9 +180,10 @@ internet, so there is no way in that is not HTTPS.
 Those same ports 80 and 443 route the applications you deploy. Everything
 else is closed -- open what you need with \`ufw allow <port>\`.
 
-To put the dashboard on a domain later, point it at this server and set it
-under Settings, then delete /data/coolify/proxy/dynamic/storiza.yaml and let
-Coolify manage its own routing.
+Do give the dashboard a domain soon. Until it has one the connection is
+encrypted but nothing vouches for the certificate, so the browser cannot tell
+you whether the server answering is really yours. Point a domain here, set it
+under Settings, and Coolify's proxy asks Let's Encrypt for a real one.
 CREDS
 
 echo "[storiza] Coolify ready at ${PANEL_URL}"
